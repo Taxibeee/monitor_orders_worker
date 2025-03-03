@@ -69,17 +69,25 @@ def check_order_status():
             response.raise_for_status()  # Raise exception for bad status codes
             
             bolt_orders = response.json().get("data", {}).get("orders", [])
+
+
+            # Flatten order_price
+            for order in bolt_orders:
+                if "order_price" in order:
+                    order.update(order.pop("order_price"))
+
+
             
             # Create a dictionary of Bolt orders for easy lookup
             bolt_orders_dict = {
-                order['order_reference']: order['order_status'] 
+                order['order_reference']: (order['order_status'], order.get("ride_price")) 
                 for order in bolt_orders
                 if order.get('order_reference')
             }
 
             # Check each in-progress order
             for order in in_progress_orders:
-                bolt_status = bolt_orders_dict.get(order.order_reference)
+                bolt_info = bolt_orders_dict.get(order.order_reference)
 
                 # Check if order hasn't been updated in 2 hours
                 if order.last_checked and order.last_checked < two_hours_ago:
@@ -90,18 +98,25 @@ def check_order_status():
                     session.delete(order)
                     continue
                 
+                if not bolt_info:
+                    print(f"Order {order.order_reference} not found in Bolt API response")
+                    continue
+
+                bolt_status, ride_price = bolt_info
+
                 if bolt_status == "finished":
-                    print(f"Order {order.order_reference} is finished. Updating status...")
-                    # Update the order status in database
-                    order.status = "finished"
-                    new_order = Order(**dict(order))
-                    session.add(new_order)
-                    session.delete(order)
+                    if ride_price is None or ride_price == 0:
+                        order.last_checked = datetime.now(utc=True)
+                        print(f"Order {order.order_reference} is finished but has no ride_price yet. Waiting for update...")
+                    else:
+                        print(f"Order {order.order_reference} is finished. Updating status...")
+                        order.order_status = "finished"
+                        new_order = Order(**dict(order))
+                        session.add(new_order)
+                        session.delete(order)
                 elif bolt_status:
                     order.last_checked = datetime.now(utc=True)
-                    print(f"Order {order.order_reference} status: {bolt_status}")
-                else:
-                    print(f"Order {order.order_reference} not found in Bolt API response")
+                    print(f"Order {order.order_reference} is still in progress. Updating last_checked...")
 
             # Commit all changes
             session.commit()

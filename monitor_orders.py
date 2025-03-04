@@ -1,5 +1,6 @@
 from sqlalchemy.orm import Session
 from database.db import get_engine
+from sqlalchemy import inspect
 from models.in_progress_orders import InProgressOrder
 from models.orders import Order
 from models.order_anomalies import OrderAnomaly
@@ -7,7 +8,9 @@ import time
 from services.token_manager import get_access_token
 import requests
 from datetime import datetime, timedelta
-
+from models.exact_debnr import ExactDebnr , Base as ExactDebnrBase
+from models.driver import DriverSQL, Base as DriverBase
+import csv
 COMPANY_ID = "129914"
 FLEET_ORDERS_URL = "https://node.bolt.eu/fleet-integration-gateway/fleetIntegration/v1/getFleetOrders"
 
@@ -41,6 +44,7 @@ def check_order_status():
             print("No orders to check")
             return
         
+        exact_debnr_mapping = load_exact_debnr_mapping()
         current_time = datetime.now(utc=True)
         two_hours_ago = current_time - timedelta(hours=2)
         
@@ -111,6 +115,47 @@ def check_order_status():
                     else:
                         print(f"Order {order.order_reference} is finished. Updating status...")
                         order.order_status = "finished"
+
+                        exact_debnr = session.query(ExactDebnr).filter_by(bolt_driver_uuid=order.driver_uuid).first()
+                        driver = session.query(DriverSQL).filter_by(bolt_driver_uuid=order.driver_uuid).first()
+
+                        if not exact_debnr and driver:
+                            ride_price = float(order.get("ride_price", 0.0) or 0.0) - float(order.get("in_app_discount", 0.0) or 0.0)
+                            tips_bolt = float(order.get("tip", 0.0) or 0.0)  
+                            commission_bolt = float(order.get("commission", 0.0) or 0.0)  # Adjust field name if different
+                            payment_method = order.get("payment_method", "")
+                            exact_debnr = ExactDebnr(
+                                bolt_driver_uuid=order.driver_uuid,
+                                driver_name=driver.full_name if driver.full_name else "Unknown",
+                                exact_debnr_number=exact_debnr_mapping.get(order.driver_uuid),
+                                ride_price_sum=ride_price,
+                                commission_bolt= commission_bolt,
+                                commission_tc=ride_price * 0.25,
+                                tips_bolt=tips_bolt,
+                                tips_mypos=0.0,
+                                card_received=0.0,
+                                cash_received=0.0,
+                                card_terminal_value = ride_price if payment_method== "card_terminal" else 0.0
+                            )
+                            session.add(exact_debnr)
+
+               
+                
+                        if exact_debnr:
+                            # Extract values from order_data (assuming these fields exist in order_price)
+                                ride_price = float(order.get("ride_price", 0.0) or 0.0) - float(order.get("in_app_discount", 0.0) or 0.0)
+                                tips_bolt = float(order.get("tip", 0.0) or 0.0)  
+                                commission_bolt = float(order.get("commission", 0.0) or 0.0)  # Adjust field name if different
+                                payment_method = order.get("payment_method", "")
+                            # Update sums
+                                exact_debnr.ride_price_sum += ride_price
+                                exact_debnr.tips_bolt += tips_bolt
+                                exact_debnr.commission_bolt += commission_bolt
+                                exact_debnr.commission_tc = exact_debnr.ride_price_sum * 0.25  # 25% of ride_price_sum
+                                exact_debnr.tips_mypos = 0.0  # Always 0
+                                if payment_method == "card_terminal":
+                                    exact_debnr.card_terminal_value += ride_price
+
                         new_order = Order(**dict(order))
                         session.add(new_order)
                         session.delete(order)
@@ -128,5 +173,34 @@ def check_order_status():
             print(f"Unexpected error: {e}")
             session.rollback()
 
+def load_exact_debnr_mapping():
+    try:
+        mapping = {}
+        with open('dim_drivers.csv', 'r') as file:
+            reader = csv.DictReader(file)
+            for row in reader:
+                uuid = row.get('bolt_driver_uuid')
+                debnr = row.get('exact_debnr')
+                if uuid:
+                    mapping[uuid] = debnr if debnr else None
+        return mapping
+    except FileNotFoundError:
+        print("dim_drivers.csv not found. exact_debnr_number will be None.")
+        return {}
+    except Exception as e:
+        print(f"Error loading dim_drivers.csv: {e}")
+        return {}
+
+
+def create_exact_debnr_table_if_not_exists():
+    engine = get_engine()
+    inspector = inspect(engine)
+    if not inspector.has_table("exact_debnr"):
+        ExactDebnrBase.metadata.create_all(engine)  # Use ExactDebnr's metadata
+        print("ExactDebnr table created")
+    else:
+        print("ExactDebnr table already exists")
+
 if __name__ == "__main__":
+    create_exact_debnr_table_if_not_exists()      
     check_order_status()

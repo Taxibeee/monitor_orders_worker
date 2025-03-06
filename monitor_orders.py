@@ -246,7 +246,7 @@ def process_single_order(engine, order, bolt_orders_dict, two_hours_ago):
 
     with Session(engine) as session:
         try:
-            if order.last_checked = order.last_checked < two_hours_ago:
+            if order.last_checked and order.last_checked < two_hours_ago:
                 print(f"Order {order.order_reference} hasn't been updated in 2 hours. Creating anomaly...")
                 # Create new anomaly record
                 anomaly = OrderAnomaly(**dict(order))

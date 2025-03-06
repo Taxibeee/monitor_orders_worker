@@ -7,7 +7,7 @@ from models.order_anomalies import OrderAnomaly
 import time
 from services.token_manager import get_access_token
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from models.exact_debnr import ExactDebnr , Base as ExactDebnrBase
 from models.driver import DriverSQL, Base as DriverBase
 import csv
@@ -29,6 +29,66 @@ def get_minimum_timestamp():
             print("No orders found in InProgressOrders table")
             return
 
+def update_exact_debnr(session, order, driver=None):
+    """
+    Dedicated function to handle ExactDebnr record creation and updates. This ensures consistent handling of ride_prices and commissions.
+
+    Args:
+        session: SQLALCHEMY session
+        order: Order object/dictionary with order details
+        driver: Optional driver record if already retrieved
+    """
+
+    # Standard way to calculate prices - always accounting for discounts
+    ride_price = float(order.get("ride_price", 0.0) or 0.0) - float(order.get("in_app_discount", 0.0) or 0.0)
+    tips_bolt = float(order.get("tip", 0.0) or 0.0)
+    commission_bolt = float(order.get("commission", 0.0) or 0.0)
+    payment_method = order.get("payment_method", "")
+
+    # load exact debnr mapping
+    exact_debnr_mapping = load_exact_debnr_mapping() if not hasattr(update_exact_debnr, 'mapping') else update_exact_debnr.mapping
+    update_exact_debnr.mapping = exact_debnr_mapping
+
+    exact_debnr = session.query(ExactDebnr).filter_by(bolt_driver_uuid=order.driver_uuid).first()
+
+    if not exact_debnr:
+        if not driver:
+            driver = session.query(DriverSQL).filter_by(bolt_driver_uuid=order.driver_uuid).first()
+
+        if driver:
+            # Create a new record with initial values
+            exact_debnr = ExactDebnr(
+                bolt_driver_uuid=order.driver_uuid,
+                driver_name=driver.full_name if driver.full_name else "Unknown",
+                exact_debnr_number=exact_debnr_mapping.get(order.driver_uuid),
+                ride_price_sum=ride_price,
+                commission_bolt=commission_bolt,
+                commission_tc=ride_price * 0.25,
+                tips_bolt=tips_bolt,
+                tips_mypos=0.0,
+                cash_received=0.0,
+                card_received=0.0,
+                card_terminal_value=ride_price if payment_method == "card_terminal" else 0.0
+            )
+            session.add(exact_debnr)
+            return exact_debnr
+        else:
+            print(f"Warning: No driver record found for UUID {order.driver_uuid}. Financial data not recorded.")
+            return None
+    else:
+        exact_debnr.ride_price_sum += ride_price
+        exact_debnr.tips_bolt += tips_bolt
+        exact_debnr.commission_bolt += commission_bolt
+
+        exact_debnr.commission_tc += (ride_price * 0.25)
+        
+        if payment_method == "card_terminal":
+            exact_debnr.card_terminal_value += ride_price
+        
+        return exact_debnr
+
+
+
 
 def check_order_status():
     """
@@ -45,7 +105,7 @@ def check_order_status():
             return
         
         exact_debnr_mapping = load_exact_debnr_mapping()
-        current_time = datetime.now(utc=True)
+        current_time = datetime.now(timezone.utc)
         two_hours_ago = current_time - timedelta(hours=2)
         
         # Set time range for API query (last 24 hours to now)
@@ -110,7 +170,7 @@ def check_order_status():
 
                 if bolt_status == "finished":
                     if ride_price is None or ride_price == 0:
-                        order.last_checked = datetime.now(utc=True)
+                        order.last_checked = datetime.now(timezone.utc)
                         print(f"Order {order.order_reference} is finished but has no ride_price yet. Waiting for update...")
                     else:
                         print(f"Order {order.order_reference} is finished. Updating status...")
@@ -156,11 +216,11 @@ def check_order_status():
                                 if payment_method == "card_terminal":
                                     exact_debnr.card_terminal_value += ride_price
 
-                        new_order = Order(**dict(order))
+                        new_order = Order(**order)
                         session.add(new_order)
                         session.delete(order)
                 elif bolt_status:
-                    order.last_checked = datetime.now(utc=True)
+                    order.last_checked = datetime.now(timezone.utc)
                     print(f"Order {order.order_reference} is still in progress. Updating last_checked...")
 
             # Commit all changes
@@ -172,6 +232,69 @@ def check_order_status():
         except Exception as e:
             print(f"Unexpected error: {e}")
             session.rollback()
+
+def process_single_order(engine, order, bolt_orders_dict, two_hours_ago):
+    """
+    Process a single order in its own transaction
+
+    Args:
+        engine (SQLALCHEMY engine)
+        order: InProgressOrder object to process
+        bolt_orders_dict: Dictionary of Bolt orders from API
+        two_hours_ago: Timestamp for checking order age
+    """
+
+    with Session(engine) as session:
+        try:
+            if order.last_checked = order.last_checked < two_hours_ago:
+                print(f"Order {order.order_reference} hasn't been updated in 2 hours. Creating anomaly...")
+                # Create new anomaly record
+                anomaly = OrderAnomaly(**dict(order))
+                session.add(anomaly)
+                session.delete(order)
+                session.commit()
+                return
+            
+            # Check if order exists in Bolt API reposne
+            bolt_info = bolt_orders_dict.get(order.order_reference)
+            if not bolt_info:
+                print(f"Order {order.order_reference} not found in Bolt API response")
+                order.last_checked = datetime.now(timezone.utc)
+                session.commit()
+                return
+            
+            bolt_status, bolt_order = bolt_info
+
+            if bolt_status == "finished":
+                # Access ride_price from full order object
+                if bolt_order.get("ride_price") is None or float(bolt_order.get("ride_price", 0.0) or 0.0) == 0:
+                    order.last_checked = datetime.now(timezone.utc)
+                    print(f"Order {order.order_reference} is finished but has no ride_price yet. Waiting for update...")
+                    session.commit()
+                    return
+                
+                print(f"Order {order.order_reference} is finished. Updating status...")
+                order.order_status = "finished"
+
+                # GEt driver record once
+                driver = session.query(DriverSQL).filter_by(bolt_driver_uuid=order.driver_uuid).first()
+
+                # update or create exact_debnr record using fucntion
+                # We now pass the complete bolt_order which has all the details
+                update_exact_debnr(session, bolt_order, driver)
+
+                # Create completed order record
+                new_order = Order(**vars(order))
+                session.add(new_order)
+                session.delete(order)
+            else:
+                order.last_checked = datetime.now(timezone.utc)
+                print(f"Order {order.order_reference} is still in progress. Updating last_checked...")
+            
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            print(f"Error processing order {order.order_reference} is still in progress. Updating last_checked... {e}")
 
 def load_exact_debnr_mapping():
     try:

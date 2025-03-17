@@ -3,7 +3,7 @@ from database.db import get_engine
 from sqlalchemy import inspect
 from models.in_progress_orders import InProgressOrder
 from models.orders import Order
-from models.order_anomalies import OrderAnomaly
+from models.order_anomalies import OrderAnomaly, Base as OrderAnomalyBase
 import time
 from services.token_manager import get_access_token
 import requests
@@ -14,20 +14,32 @@ import csv
 COMPANY_ID = "129914"
 FLEET_ORDERS_URL = "https://node.bolt.eu/fleet-integration-gateway/fleetIntegration/v1/getFleetOrders"
 
+from datetime import timezone
+
 def get_minimum_timestamp():
     engine = get_engine()
     with Session(engine) as session:
         # Get the minimum timestamp from the InProgressOrders table
         min_timestamp = session.query(InProgressOrder.order_created_timestamp).order_by(InProgressOrder.order_created_timestamp.asc()).first()
-
+        
         if min_timestamp:
-            # Subtract 24 hours from the minimum timestamp
-            min_timestamp = min_timestamp[0] 
-            return min_timestamp - 50 # Add buffer for being on the safe side
+            # min_timestamp is a tuple with one element, and that element should be a datetime
+            timestamp = min_timestamp[0]
+            if isinstance(timestamp, datetime):
+                # Make sure the timestamp is timezone-aware
+                if timestamp.tzinfo is None or timestamp.tzinfo.utcoffset(timestamp) is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                return int(timestamp.timestamp()) - 50
+            else:
+                # If it's already a timestamp (int), just return it with the offset
+                return timestamp - 50
         else:
             # If no orders, return None
-            print("No orders found in InProgressOrders table")
-            return
+            print("No orders found in InProgressOrders table") 
+            return None
+
+
+
 
 def update_exact_debnr(session, order, driver=None):
     """
@@ -106,7 +118,7 @@ def check_order_status():
         
         exact_debnr_mapping = load_exact_debnr_mapping()
         current_time = datetime.now(timezone.utc)
-        two_hours_ago = current_time - timedelta(hours=2)
+        two_hours_ago = current_time - timedelta(hours=2) 
         
         # Set time range for API query (last 24 hours to now)
         end_ts = int(time.time())
@@ -144,7 +156,7 @@ def check_order_status():
             
             # Create a dictionary of Bolt orders for easy lookup
             bolt_orders_dict = {
-                order['order_reference']: (order['order_status'], order.get("ride_price")) 
+                order['order_reference']: (order['order_status'], order) 
                 for order in bolt_orders
                 if order.get('order_reference')
             }
@@ -152,12 +164,44 @@ def check_order_status():
             # Check each in-progress order
             for order in in_progress_orders:
                 bolt_info = bolt_orders_dict.get(order.order_reference)
+                
+                if order.last_checked and (order.last_checked.tzinfo is None or order.last_checked.tzinfo.utcoffset(order.last_checked) is None):
+                    order.last_checked = order.last_checked.replace(tzinfo=timezone.utc)
+
 
                 # Check if order hasn't been updated in 2 hours
                 if order.last_checked and order.last_checked < two_hours_ago:
                     print(f"Order {order.order_reference} hasn't been updated in 2 hours. Creating anomaly...")
                     # Create new anomaly record
-                    anomaly = OrderAnomaly(**dict(order))
+                    order_dict = {
+                        'order_reference': order.order_reference,
+                        'driver_name': order.driver_name,
+                        'driver_uuid': order.driver_uuid,
+                        'payment_method': order.payment_method,
+                        'order_status': order.order_status,
+                        'vehicle_model': order.vehicle_model,
+                        'vehicle_license_plate': order.vehicle_license_plate,
+                        'terminal_name': order.terminal_name,
+                        'pickup_address': order.pickup_address,
+                        'ride_distance': order.ride_distance,
+                        'payment_confirmed_timestamp': order.payment_confirmed_timestamp,
+                        'order_created_timestamp': order.order_created_timestamp,
+                        'order_accepted_timestamp': order.order_accepted_timestamp,
+                        'order_pickup_timestamp': order.order_pickup_timestamp,
+                        'order_dropoff_timestamp': order.order_dropoff_timestamp,
+                        'order_finished_timestamp': order.order_finished_timestamp,
+                        'ride_price': order.ride_price,
+                        'booking_fee': order.booking_fee,
+                        'toll_fee': order.toll_fee,
+                        'tip': order.tip,
+                        'cash_discount': order.cash_discount,
+                        'commission': order.commission,
+                        'in_app_discount': order.in_app_discount,
+                        'net_earnings': order.net_earnings,
+                        'cancellation_fee': order.cancellation_fee
+                        # 'last_checked' omitted since it's not in OrderAnomaly (unless you've added it)
+                    }
+                    anomaly = OrderAnomaly(**order_dict)
                     session.add(anomaly)
                     session.delete(order)
                     continue
@@ -166,10 +210,10 @@ def check_order_status():
                     print(f"Order {order.order_reference} not found in Bolt API response")
                     continue
 
-                bolt_status, ride_price = bolt_info
+                bolt_status, bolt_order = bolt_info
 
                 if bolt_status == "finished":
-                    if ride_price is None or ride_price == 0:
+                    if bolt_order.get("ride_price") is None or float(bolt_order.get("ride_price", 0.0) or 0.0) == 0:
                         order.last_checked = datetime.now(timezone.utc)
                         print(f"Order {order.order_reference} is finished but has no ride_price yet. Waiting for update...")
                     else:
@@ -179,16 +223,16 @@ def check_order_status():
                         exact_debnr = session.query(ExactDebnr).filter_by(bolt_driver_uuid=order.driver_uuid).first()
                         driver = session.query(DriverSQL).filter_by(bolt_driver_uuid=order.driver_uuid).first()
 
-                        if not exact_debnr and driver:
-                            ride_price = float(order.get("ride_price", 0.0) or 0.0) - float(order.get("in_app_discount", 0.0) or 0.0)
-                            tips_bolt = float(order.get("tip", 0.0) or 0.0)  
-                            commission_bolt = float(order.get("commission", 0.0) or 0.0)  # Adjust field name if different
-                            payment_method = order.get("payment_method", "")
+                        if not exact_debnr and driver: 
+                            ride_price = float(bolt_order.get("ride_price", 0.0) or 0.0) - float(bolt_order.get("in_app_discount", 0.0) or 0.0)
+                            tips_bolt = float(bolt_order.get("tip", 0.0) or 0.0)  
+                            commission_bolt = float(bolt_order.get("commission", 0.0) or 0.0)  # Adjust field name if different
+                            payment_method = bolt_order.get("payment_method", "")
                             exact_debnr = ExactDebnr(
                                 bolt_driver_uuid=order.driver_uuid,
                                 driver_name=driver.full_name if driver.full_name else "Unknown",
                                 exact_debnr_number=exact_debnr_mapping.get(order.driver_uuid),
-                                ride_price_sum=ride_price,
+                                ride_price_sum=ride_price, 
                                 commission_bolt= commission_bolt,
                                 commission_tc=ride_price * 0.25,
                                 tips_bolt=tips_bolt,
@@ -202,11 +246,11 @@ def check_order_status():
                
                 
                         if exact_debnr:
-                            # Extract values from order_data (assuming these fields exist in order_price)
-                                ride_price = float(order.get("ride_price", 0.0) or 0.0) - float(order.get("in_app_discount", 0.0) or 0.0)
-                                tips_bolt = float(order.get("tip", 0.0) or 0.0)  
-                                commission_bolt = float(order.get("commission", 0.0) or 0.0)  # Adjust field name if different
-                                payment_method = order.get("payment_method", "")
+                            # Extract values from bolt_order
+                                ride_price = float(bolt_order.get("ride_price", 0.0) or 0.0) - float(bolt_order.get("in_app_discount", 0.0) or 0.0)
+                                tips_bolt = float(bolt_order.get("tip", 0.0) or 0.0)  
+                                commission_bolt = float(bolt_order.get("commission", 0.0) or 0.0)  # Adjust field name if different
+                                payment_method = bolt_order.get("payment_method", "")
                             # Update sums
                                 exact_debnr.ride_price_sum += ride_price
                                 exact_debnr.tips_bolt += tips_bolt
@@ -216,7 +260,7 @@ def check_order_status():
                                 if payment_method == "card_terminal":
                                     exact_debnr.card_terminal_value += ride_price
 
-                        new_order = Order(**order)
+                        new_order = Order(**vars(order))
                         session.add(new_order)
                         session.delete(order)
                 elif bolt_status:
@@ -246,16 +290,45 @@ def process_single_order(engine, order, bolt_orders_dict, two_hours_ago):
 
     with Session(engine) as session:
         try:
-            if order.last_checked and order.last_checked < two_hours_ago:
+            if order.last_checked and (order.last_checked.tzinfo is None or order.last_checked.tzinfo.utcoffset(order.last_checked) is None):
                 print(f"Order {order.order_reference} hasn't been updated in 2 hours. Creating anomaly...")
                 # Create new anomaly record
-                anomaly = OrderAnomaly(**dict(order))
+                
+                order_dict = {
+                        'order_reference': order.order_reference,
+                        'driver_name': order.driver_name,
+                        'driver_uuid': order.driver_uuid,
+                        'payment_method': order.payment_method,
+                        'order_status': order.order_status,
+                        'vehicle_model': order.vehicle_model,
+                        'vehicle_license_plate': order.vehicle_license_plate,
+                        'terminal_name': order.terminal_name,
+                        'pickup_address': order.pickup_address,
+                        'ride_distance': order.ride_distance,
+                        'payment_confirmed_timestamp': order.payment_confirmed_timestamp,
+                        'order_created_timestamp': order.order_created_timestamp,
+                        'order_accepted_timestamp': order.order_accepted_timestamp,
+                        'order_pickup_timestamp': order.order_pickup_timestamp,
+                        'order_dropoff_timestamp': order.order_dropoff_timestamp,
+                        'order_finished_timestamp': order.order_finished_timestamp,
+                        'ride_price': order.ride_price,
+                        'booking_fee': order.booking_fee,
+                        'toll_fee': order.toll_fee,
+                        'tip': order.tip,
+                        'cash_discount': order.cash_discount,
+                        'commission': order.commission,
+                        'in_app_discount': order.in_app_discount,
+                        'net_earnings': order.net_earnings,
+                        'cancellation_fee': order.cancellation_fee
+                        # 'last_checked' omitted since it's not in OrderAnomaly (unless you've added it)
+                }
+                anomaly = OrderAnomaly(**order_dict)
                 session.add(anomaly)
                 session.delete(order)
                 session.commit()
                 return
             
-            # Check if order exists in Bolt API reposne
+            # Check if order exists in Bolt API response
             bolt_info = bolt_orders_dict.get(order.order_reference)
             if not bolt_info:
                 print(f"Order {order.order_reference} not found in Bolt API response")
@@ -266,7 +339,7 @@ def process_single_order(engine, order, bolt_orders_dict, two_hours_ago):
             bolt_status, bolt_order = bolt_info
 
             if bolt_status == "finished":
-                # Access ride_price from full order object
+                # Access ride_price from full order object 
                 if bolt_order.get("ride_price") is None or float(bolt_order.get("ride_price", 0.0) or 0.0) == 0:
                     order.last_checked = datetime.now(timezone.utc)
                     print(f"Order {order.order_reference} is finished but has no ride_price yet. Waiting for update...")
@@ -277,7 +350,7 @@ def process_single_order(engine, order, bolt_orders_dict, two_hours_ago):
                 order.order_status = "finished"
 
                 # GEt driver record once
-                driver = session.query(DriverSQL).filter_by(bolt_driver_uuid=order.driver_uuid).first()
+                driver = session.query(DriverSQL).filter_by(bolt_driver_uuid=order.driver_uuid).first() 
 
                 # update or create exact_debnr record using fucntion
                 # We now pass the complete bolt_order which has all the details
@@ -324,6 +397,16 @@ def create_exact_debnr_table_if_not_exists():
     else:
         print("ExactDebnr table already exists")
 
+def create_anomalies_table_if_not_exists():
+    engine = get_engine()
+    inspector = inspect(engine)
+    if not inspector.has_table("order_anomalies"):
+        OrderAnomalyBase.metadata.create_all(engine)  # Use OrderAnomaly's metadata
+        print("OrderAnomaly table created")
+    else:
+        print("OrderAnomaly table already exists")
+
 if __name__ == "__main__":
-    create_exact_debnr_table_if_not_exists()      
+    create_exact_debnr_table_if_not_exists()     
+    create_anomalies_table_if_not_exists() 
     check_order_status()
